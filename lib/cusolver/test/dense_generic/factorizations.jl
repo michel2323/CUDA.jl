@@ -84,6 +84,87 @@ if cuSOLVER.version() >= v"11.6.0"
             @test dI - dv * dt * dv' ≈ dH
         end
     end
+
+    @testset "unit_lower_triangular! elty = $elty" for elty in [Float32, Float64, ComplexF32, ComplexF64]
+        for (r, c) in ((m, n), (n, m), (n, n))
+            A = rand(elty, r, c)
+            reference = tril(A, -1) + Matrix{elty}(I, r, c)
+            @test collect(cuSOLVER.unit_lower_triangular!(CuMatrix(A))) == reference
+        end
+    end
+
+    @testset "larfb! elty = $elty" for elty in [Float32, Float64, ComplexF32, ComplexF64]
+        trans_types = elty <: Real ? ('N', 'T', 'C') : ('N', 'C')
+        dV, dτ = cuSOLVER.geqrf!(CuMatrix(rand(elty, m, p)))
+        cuSOLVER.unit_lower_triangular!(dV)
+        dt = cuSOLVER.larft!('F', 'C', dV, dτ, CuMatrix{elty}(undef, p, p))
+        # the block reflector, formed explicitly
+        H = Matrix{elty}(I, m, m) - collect(dV) * collect(dt) * collect(dV)'
+
+        @testset "side = $side, trans = $trans" for side in ('L', 'R'), trans in trans_types
+            C = side == 'L' ? rand(elty, m, n) : rand(elty, n, m)
+            op = trans == 'N' ? H : H'
+            dC = CuMatrix(C)
+            cuSOLVER.larfb!(side, trans, 'F', 'C', dV, dt, dC)
+            @test collect(dC) ≈ (side == 'L' ? op * C : C * op)
+        end
+    end
+
+    @testset "Xormqr! elty = $elty" for elty in [Float32, Float64, ComplexF32, ComplexF64]
+        trans_types = elty <: Real ? ('N', 'T', 'C') : ('N', 'C')
+        # tall, wide and square factorizations
+        @testset "size = $((r, c))" for (r, c) in ((m, n), (n, m), (n, n))
+            dA, dτ = cuSOLVER.geqrf!(CuMatrix(rand(elty, r, c)))
+            A, τ = collect(dA), collect(dτ)
+            # blocksize below, at and above the number of reflectors
+            @testset "blocksize = $blocksize" for blocksize in (1, 3, 64)
+                @testset "trans = $trans" for trans in trans_types
+                    # LAPACK only accepts 'T' for real matrices, where cuSOLVER
+                    # additionally supports the equivalent 'C'
+                    ref_trans = elty <: Real && trans == 'C' ? 'T' : trans
+
+                    B = rand(elty, r, p)
+                    dB = CuMatrix(B)
+                    cuSOLVER.Xormqr!('L', trans, dA, dτ, dB; blocksize)
+                    @test collect(dB) ≈ LAPACK.ormqr!('L', ref_trans, copy(A), τ, copy(B))
+
+                    C = rand(elty, p, r)
+                    dC = CuMatrix(C)
+                    cuSOLVER.Xormqr!('R', trans, dA, dτ, dC; blocksize)
+                    @test collect(dC) ≈ LAPACK.ormqr!('R', ref_trans, copy(A), τ, copy(C))
+
+                    v = rand(elty, r)
+                    dv = CuVector(v)
+                    cuSOLVER.Xormqr!('L', trans, dA, dτ, dv; blocksize)
+                    @test collect(dv) ≈ LAPACK.ormqr!('L', ref_trans, copy(A), τ, copy(v))
+                end
+            end
+            # the blocked implementation must agree with cuSOLVER's legacy one
+            @testset "agrees with ormqr!" for trans in trans_types
+                B = CuMatrix(rand(elty, r, p))
+                @test collect(cuSOLVER.ormqr!('L', trans, dA, dτ, copy(B))) ≈
+                      collect(cuSOLVER.Xormqr!('L', trans, dA, dτ, copy(B)))
+            end
+        end
+    end
+
+    @testset "Xorgqr! elty = $elty" for elty in [Float32, Float64, ComplexF32, ComplexF64]
+        @testset "size = $((r, c))" for (r, c) in ((m, n), (n, m), (n, n))
+            dA, dτ = cuSOLVER.geqrf!(CuMatrix(rand(elty, r, c)))
+            A, τ = collect(dA), collect(dτ)
+            @testset "blocksize = $blocksize" for blocksize in (1, 3, 64)
+                dQ = cuSOLVER.Xorgqr!(copy(dA), dτ; blocksize)
+                @test collect(dQ' * dQ) ≈ I
+                @test collect(dQ) ≈ LAPACK.orgqr!(copy(A), τ)[:, 1:size(dQ, 2)]
+            end
+            # fewer reflectors than columns of Q
+            k = max(1, length(τ) - 2)
+            dQ = cuSOLVER.Xorgqr!(copy(dA), dτ[1:k])
+            @test collect(dQ) ≈ LAPACK.orgqr!(copy(A), τ[1:k])[:, 1:size(dQ, 2)]
+            # and agreement with cuSOLVER's legacy implementation
+            @test collect(cuSOLVER.orgqr!(copy(dA), dτ)) ≈ collect(cuSOLVER.Xorgqr!(copy(dA), dτ))
+        end
+    end
 end
 
 @testset "sytrs! elty = $elty" for elty in [Float32, Float64, ComplexF32, ComplexF64]
