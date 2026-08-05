@@ -367,6 +367,23 @@ for (bname, fname, elty) in ((:cusolverDnSormqr_bufferSize, :cusolverDnSormqr, :
                 return out[] * sizeof($elty)
             end
 
+            # this routine reports its workspace size as a 32-bit element count and
+            # rejects any problem that would overflow it, however much device memory
+            # is available. Blocking the reflectors as above does not always help:
+            # the workspace also grows with the number of rows, by an amount that
+            # differs between cuSOLVER versions. So ask, and fall back to a blocked
+            # Householder implementation that needs only O((m + n) * blocksize)
+            # scratch space and takes 64-bit dimensions.
+            if has_blocked_householder()
+                lwork = Ref{Cint}(0)
+                if max(m, n, lda, ldc) > typemax(Cint) ||
+                   $(Symbol(:unchecked_, bname))(dh, side, trans, m, n, k, A, lda, tau, C,
+                                                 ldc, lwork) != CUSOLVER_STATUS_SUCCESS ||
+                   lwork[] < 0
+                    return Xormqr!(side, trans, A, tau, C)
+                end
+            end
+
             with_workspace(dh.workspace_gpu, bufferSize) do buffer
                 $fname(dh, side, trans, m, n, k, A, lda, tau, C, ldc,
                        buffer, sizeof(buffer) ÷ sizeof($elty), dh.info)
@@ -397,6 +414,23 @@ for (bname, fname, elty) in ((:cusolverDnSorgqr_bufferSize, :cusolverDnSorgqr, :
                 out = Ref{Cint}(0)
                 $bname(dh, m, n, k, A, lda, tau, out)
                 return out[] * sizeof($elty)
+            end
+
+            # as in `ormqr!` above, hand problems that the legacy routine cannot
+            # address to the blocked Householder implementation. This workspace query
+            # does not fail on overflow but wraps around: to a negative size at
+            # first, and past 2^32 elements to a small positive one that looks valid
+            # and makes cuSOLVER write out of bounds. The workspace is no larger than
+            # Q itself, up to lower-order terms, so bounding `lda * n` rules out the
+            # second case.
+            if has_blocked_householder()
+                lwork = Ref{Cint}(0)
+                if lda * n > typemax(Cint) ||
+                   $(Symbol(:unchecked_, bname))(dh, m, n, k, A, lda, tau, lwork) !=
+                       CUSOLVER_STATUS_SUCCESS ||
+                   lwork[] < 0
+                    return Xorgqr!(A, tau)
+                end
             end
 
             if bufferSize() < 0
