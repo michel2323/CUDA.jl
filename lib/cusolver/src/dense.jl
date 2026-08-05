@@ -325,6 +325,18 @@ for (bname, fname, elty) in ((:cusolverDnSormqr_bufferSize, :cusolverDnSormqr, :
                 return out[] * sizeof($elty)
             end
 
+            # this routine wants a workspace that grows like O(m * k) and reports
+            # its size as a 32-bit element count, so it rejects any problem whose
+            # workspace would exceed typemax(Cint) elements -- a square QR of
+            # about 32500x32500 and up -- however much device memory is
+            # available. Fall back to a blocked Householder implementation, which
+            # needs only O((m + n) * blocksize) scratch space.
+            if has_blocked_householder() &&
+               $(Symbol(:unchecked_, bname))(dh, side, trans, m, n, k, A, lda, tau, C,
+                                             ldc, Ref{Cint}(0)) != CUSOLVER_STATUS_SUCCESS
+                return Xormqr!(side, trans, A, tau, C)
+            end
+
             with_workspace(dh.workspace_gpu, bufferSize) do buffer
                 $fname(dh, side, trans, m, n, k, A, lda, tau, C, ldc,
                        buffer, sizeof(buffer) ÷ sizeof($elty), dh.info)
@@ -355,6 +367,16 @@ for (bname, fname, elty) in ((:cusolverDnSorgqr_bufferSize, :cusolverDnSorgqr, :
                 out = Ref{Cint}(0)
                 $bname(dh, m, n, k, A, lda, tau, out)
                 return out[] * sizeof($elty)
+            end
+
+            # as in `ormqr!` above, the legacy interface indexes with 32-bit
+            # integers; hand matrices it cannot address to the blocked
+            # Householder implementation.
+            if has_blocked_householder() &&
+               (lda * n > typemax(Cint) ||
+                $(Symbol(:unchecked_, bname))(dh, m, n, k, A, lda, tau, Ref{Cint}(0)) !=
+                    CUSOLVER_STATUS_SUCCESS)
+                return Xorgqr!(A, tau)
             end
 
             with_workspace(dh.workspace_gpu, bufferSize) do buffer

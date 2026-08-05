@@ -231,6 +231,260 @@ function larft!(direct::Char, storev::Char, v::StridedCuMatrix{T}, tau::StridedC
     t
 end
 
+# larfb!
+#
+# cuSOLVER has no `Xlarfb`, so the block reflector is applied with cuBLAS. All of
+# the operations below are GEMMs and TRMMs, which take 64-bit dimensions, so this
+# works for matrices of any size.
+"""
+    larfb!(side, trans, direct, storev, V, t, C)
+    larfb!(side, trans, direct, storev, V, t, C, work)
+
+Apply the block reflector `H = I - V * t * Vᴴ` to `C`, overwriting it with `H * C`
+(`side = 'L'`, `trans = 'N'`), `Hᴴ * C` (`side = 'L'`, `trans = 'T'` or `'C'`),
+`C * H` (`side = 'R'`, `trans = 'N'`) or `C * Hᴴ` (`side = 'R'`, `trans = 'T'` or
+`'C'`).
+
+`V` holds the elementary reflectors in unit lower trapezoidal form and `t` is the
+triangular factor computed by [`larft!`](@ref). Only `direct = 'F'` and
+`storev = 'C'` are supported. `work` is a scratch matrix of size `(k, n)` for
+`side = 'L'` and `(m, k)` for `side = 'R'`, where `(m, n) = size(C)` and
+`k = size(V, 2)`; it is allocated on the fly if not provided.
+"""
+function larfb!(side::Char, trans::Char, direct::Char, storev::Char,
+                V::StridedCuMatrix{T}, t::StridedCuMatrix{T},
+                C::StridedCuMatrix{T}, work::StridedCuMatrix{T}) where {T <: BlasFloat}
+    # Support trans = 'C' for real matrices
+    trans = T <: Real && trans == 'C' ? 'T' : trans
+    (T <: Complex) && (trans == 'T') && throw(ArgumentError("trans = 'T' is not supported with complex matrices."))
+    chkside(side)
+    chktrans(trans)
+    (direct != 'F') && throw(ArgumentError("Only direct = 'F' is supported."))
+    (storev != 'C') && throw(ArgumentError("Only storev = 'C' is supported."))
+
+    m, n = size(C)
+    nv, k = size(V)
+    mt, nt = size(t)
+    (mt != k || nt != k) && throw(DimensionMismatch("the triangular factor of the block reflector is ($mt, $nt) and must be ($k, $k)."))
+    if nv != (side == 'L' ? m : n)
+        throw(DimensionMismatch("the reflectors have $nv rows, which must match the $(side == 'L' ? "first" : "second") dimension of C, $(side == 'L' ? m : n)."))
+    end
+    mw, nw = size(work)
+    if (side == 'L' && (mw < k || nw < n)) || (side == 'R' && (mw < m || nw < k))
+        throw(DimensionMismatch("the workspace is ($mw, $nw) and must be at least $(side == 'L' ? "($k, $n)" : "($m, $k)")."))
+    end
+    k == 0 && return C
+
+    # H = I - V t Vᴴ, so Hᴴ = I - V tᴴ Vᴴ
+    transt = trans == 'N' ? 'N' : (T <: Real ? 'T' : 'C')
+    transv = T <: Real ? 'T' : 'C'
+
+    if side == 'L'
+        W = view(work, 1:k, 1:n)
+        cuBLAS.gemm!(transv, 'N', one(T), V, C, zero(T), W)      # W  = Vᴴ C
+        cuBLAS.trmm!('L', 'U', transt, 'N', one(T), t, W, W)     # W  = op(t) W
+        cuBLAS.gemm!('N', 'N', -one(T), V, W, one(T), C)         # C -= V W
+    else
+        W = view(work, 1:m, 1:k)
+        cuBLAS.gemm!('N', 'N', one(T), C, V, zero(T), W)         # W  = C V
+        cuBLAS.trmm!('R', 'U', transt, 'N', one(T), t, W, W)     # W  = W op(t)
+        cuBLAS.gemm!('N', transv, -one(T), W, V, one(T), C)      # C -= W Vᴴ
+    end
+
+    C
+end
+
+function larfb!(side::Char, trans::Char, direct::Char, storev::Char,
+                V::StridedCuMatrix{T}, t::StridedCuMatrix{T},
+                C::StridedCuMatrix{T}) where {T <: BlasFloat}
+    chkside(side)
+    m, n = size(C)
+    k = size(V, 2)
+    work = side == 'L' ? similar(C, k, n) : similar(C, m, k)
+    try
+        larfb!(side, trans, direct, storev, V, t, C, work)
+    finally
+        unsafe_free!(work)
+    end
+end
+
+_unit_lower(v, i, j) = i > j ? v : (i == j ? one(v) : zero(v))
+
+"""
+    unit_lower_triangular!(V)
+
+Overwrite `V` in place with its unit lower trapezoidal part: the strict upper
+triangle is set to zero and the diagonal to one.
+
+[`geqrf!`](@ref) leaves R in the upper triangle of the matrix that stores the
+elementary reflectors, whereas [`larft!`](@ref) and [`larfb!`](@ref) expect the
+reflectors in unit lower trapezoidal form.
+"""
+function unit_lower_triangular!(V::StridedCuMatrix)
+    m, n = size(V)
+    V .= _unit_lower.(V, 1:m, (1:n)')
+    V
+end
+
+# Default block size of the blocked Householder implementations below, chosen as
+# a compromise: a larger value amortises the per-block `larft!` call and kernel
+# launches over more columns, but `larft!` itself costs O(m * k * blocksize), so
+# past some point it dominates. Measured on an RTX 4080 for m = k = 8192, the
+# optimum is around 512 in Float32 and around 128 in Float64; 128 is within a few
+# percent of cuSOLVER's legacy `ormqr` in both. The workspace grows linearly with
+# this value, so even large block sizes stay negligible.
+const WY_BLOCKSIZE = 128
+
+# `larft!`, and therefore everything built on top of it, needs CUDA 12.4
+has_blocked_householder() = cuSOLVER.version() >= v"11.6.0"
+
+"""
+    Xormqr!(side, trans, A, tau, C; blocksize=$(WY_BLOCKSIZE))
+
+Multiply `C` in place by the orthogonal (unitary) matrix `Q` of the QR
+factorization stored in `A` and `tau`, as returned by [`Xgeqrf!`](@ref) or
+[`geqrf!`](@ref): `Q * C`, `Qᴴ * C`, `C * Q` or `C * Qᴴ` depending on `side` and
+`trans`.
+
+This is a blocked Householder (compact WY) implementation on top of
+[`larft!`](@ref) and cuBLAS. It exists because cuSOLVER only provides `ormqr` in
+its legacy 32-bit interface, which wants a workspace growing like `O(m * k)` and
+reports its size as a 32-bit element count; it therefore refuses any problem
+needing more than `typemax(Cint)` workspace elements — a square QR of about
+32500x32500 and up — however much device memory is available. This routine needs
+only `O((m + n) * blocksize)` scratch space and places no 32-bit limit on the
+problem size.
+
+See also [`ormqr!`](@ref), which uses cuSOLVER's legacy routine and falls back to
+this one for problems it cannot handle.
+"""
+function Xormqr!(side::Char, trans::Char, A::StridedCuMatrix{T}, tau::StridedCuVector{T},
+                 C::StridedCuVecOrMat{T}; blocksize::Integer=WY_BLOCKSIZE) where {T <: BlasFloat}
+    # Support trans = 'C' for real matrices
+    trans = T <: Real && trans == 'C' ? 'T' : trans
+    (T <: Complex) && (trans == 'T') && throw(ArgumentError("trans = 'T' is not supported with complex matrices."))
+    chkside(side)
+    chktrans(trans)
+    (blocksize < 1) && throw(ArgumentError("blocksize must be positive."))
+
+    m, n = ndims(C) == 2 ? size(C) : (length(C), 1)
+    mA = size(A, 1)
+    k = length(tau)
+    if side == 'L' && m != mA
+        throw(DimensionMismatch("for a left-sided multiplication, the first dimension of C, $m, must equal the first dimension of A, $mA"))
+    end
+    if side == 'R' && n != mA
+        throw(DimensionMismatch("for a right-sided multiplication, the second dimension of C, $n, must equal the first dimension of A, $mA"))
+    end
+    if side == 'L' && k > m
+        throw(DimensionMismatch("invalid number of reflectors: k = $k should be <= m = $m"))
+    end
+    if side == 'R' && k > n
+        throw(DimensionMismatch("invalid number of reflectors: k = $k should be <= n = $n"))
+    end
+    k == 0 && return C
+
+    Cm = ndims(C) == 2 ? C : reshape(C, m, 1)
+    nb = min(blocksize, k)
+    V = similar(A, mA, nb)                                    # panel of reflectors
+    t = similar(A, nb, nb)                                    # its triangular factor
+    work = side == 'L' ? similar(A, nb, n) : similar(A, m, nb)
+
+    # Q = H(1) H(2) ... H(k), so Qᴴ * C and C * Q consume the blocks front to
+    # back while Q * C and C * Qᴴ consume them back to front.
+    forward = (side == 'L') ⊻ (trans == 'N')
+    offsets = forward ? (0:nb:k-1) : reverse(0:nb:k-1)
+
+    try
+        for j in offsets
+            jb = min(nb, k - j)
+            # H(j+1) ... H(j+jb) only acts on rows j+1:mA
+            Vj = view(V, 1:(mA-j), 1:jb)
+            copyto!(Vj, view(A, (j+1):mA, (j+1):(j+jb)))
+            unit_lower_triangular!(view(Vj, 1:jb, 1:jb))
+            tj = view(t, 1:jb, 1:jb)
+            larft!('F', 'C', Vj, view(tau, (j+1):(j+jb)), tj)
+
+            Cj = side == 'L' ? view(Cm, (j+1):mA, :) : view(Cm, :, (j+1):mA)
+            larfb!(side, trans, 'F', 'C', Vj, tj, Cj, work)
+        end
+    finally
+        unsafe_free!(V)
+        unsafe_free!(t)
+        unsafe_free!(work)
+    end
+
+    C
+end
+
+"""
+    Xorgqr!(A, tau; blocksize=$(WY_BLOCKSIZE))
+
+Overwrite `A` with the first `min(size(A)...)` columns of the orthogonal
+(unitary) matrix `Q` of the QR factorization stored in `A` and `tau`, as returned
+by [`Xgeqrf!`](@ref) or [`geqrf!`](@ref).
+
+Like [`Xormqr!`](@ref) this is a blocked Householder (compact WY) implementation
+that avoids cuSOLVER's legacy 32-bit `orgqr`, and it does so without allocating a
+second copy of `Q`.
+"""
+function Xorgqr!(A::StridedCuMatrix{T}, tau::StridedCuVector{T};
+                 blocksize::Integer=WY_BLOCKSIZE) where {T <: BlasFloat}
+    (blocksize < 1) && throw(ArgumentError("blocksize must be positive."))
+    m = size(A, 1)
+    n = min(m, size(A, 2))
+    k = length(tau)
+    (k > n) && throw(DimensionMismatch("invalid number of reflectors: k = $k should be <= n = $n"))
+
+    # columns k+1:n of Q are the corresponding columns of the identity matrix,
+    # which the block reflectors below are then applied to
+    if k < n
+        view(A, :, (k+1):n) .= T.((1:m) .== ((k+1):n)')
+    end
+
+    if k > 0
+        nb = min(blocksize, k)
+        V = similar(A, m, nb)
+        t = similar(A, nb, nb)
+        Y = similar(A, nb, nb)
+        work = similar(A, nb, n)
+
+        try
+            # build Q back to front, so that the columns to the right of the
+            # current panel already hold H(j+jb+1) ... H(k) times the identity
+            for j in reverse(0:nb:k-1)
+                jb = min(nb, k - j)
+                Vj = view(V, 1:(m-j), 1:jb)
+                copyto!(Vj, view(A, (j+1):m, (j+1):(j+jb)))
+                V1 = view(Vj, 1:jb, 1:jb)
+                unit_lower_triangular!(V1)
+                tj = view(t, 1:jb, 1:jb)
+                larft!('F', 'C', Vj, view(tau, (j+1):(j+jb)), tj)
+
+                if j + jb < n
+                    larfb!('L', 'N', 'F', 'C', Vj, tj, view(A, (j+1):m, (j+jb+1):n), work)
+                end
+
+                # the leading jb columns of I - V t Vᴴ are [I; 0] - V * (t * V1ᴴ)
+                Yj = view(Y, 1:jb, 1:jb)
+                Yj .= adjoint(V1)
+                cuBLAS.trmm!('L', 'U', 'N', 'N', one(T), tj, Yj, Yj)
+                Aj = view(A, (j+1):m, (j+1):(j+jb))
+                cuBLAS.gemm!('N', 'N', -one(T), Vj, Yj, zero(T), Aj)
+                view(Aj, 1:jb, 1:jb) .+= T.((1:jb) .== (1:jb)')
+                fill!(view(A, 1:j, (j+1):(j+jb)), zero(T))
+            end
+        finally
+            unsafe_free!(V)
+            unsafe_free!(t)
+            unsafe_free!(Y)
+            unsafe_free!(work)
+        end
+    end
+
+    n < size(A, 2) ? A[:, 1:n] : A
+end
+
 # Xgesvd
 function Xgesvd!(jobu::Char, jobvt::Char, A::StridedCuMatrix{T}) where {T <: BlasFloat}
     m, n = size(A)
