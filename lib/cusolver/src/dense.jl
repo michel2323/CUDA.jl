@@ -507,6 +507,18 @@ for (bname, fname, elty, relty) in ((:cusolverDnSgesvd_bufferSize, :cusolverDnSg
             (m < n) && throw(ArgumentError("CUSOLVER's gesvd requires m ≥ n"))
             k = min(m, n)
             lda = max(1, stride(A, 2))
+            dh = dense_handle()
+
+            # this routine reports its workspace size as a 32-bit element count, and
+            # its query rejects matrices of about 2^31 elements and more (and fewer
+            # when they are very tall). The same algorithm in the 64-bit API has no
+            # such limit and the same interface, so hand those problems to it.
+            lwork = Ref{Cint}(0)
+            if max(m, n, lda) > typemax(Cint) ||
+               $(Symbol(:unchecked_, bname))(dh, m, n, lwork) != CUSOLVER_STATUS_SUCCESS ||
+               lwork[] < 0
+                return Xgesvd!(jobu, jobvt, A)
+            end
 
             U = if jobu === 'A'
                 similar(A, $elty, (m, m))
@@ -529,7 +541,6 @@ for (bname, fname, elty, relty) in ((:cusolverDnSgesvd_bufferSize, :cusolverDnSg
                 error("jobvt must be one of 'A', 'S', 'O', or 'N'")
             end
             ldvt = Vt == CU_NULL ? 1 : max(1, stride(Vt, 2))
-            dh = dense_handle()
 
             function bufferSize()
                 out = Ref{Cint}(0)
@@ -557,6 +568,34 @@ for (bname, fname, elty, relty) in ((:cusolverDnSgesvdj_bufferSize, :cusolverDnS
                                     (:cusolverDnCgesvdj_bufferSize, :cusolverDnCgesvdj, :ComplexF32, :Float32),
                                     (:cusolverDnZgesvdj_bufferSize, :cusolverDnZgesvdj, :ComplexF64, :Float64))
     @eval begin
+        # whether the 32-bit API can serve this problem at all. The workspace query
+        # reports a 32-bit element count: it fails for matrices of about 2^31
+        # elements and more (fewer when very tall or wide), and for workspaces in
+        # [2^31, 2^32) elements -- square matrices from about 32767^2 -- it reports
+        # success with a size of 0. Ask with placeholder outputs so that nothing of
+        # the size of A needs to be allocated to find out.
+        function gesvdj_fits(jobz::Char, econ::Int, A::StridedCuMatrix{$elty})
+            m, n = size(A)
+            lda = max(1, stride(A, 2))
+            max(m, n, lda) > typemax(Cint) && return false
+            dh = dense_handle()
+            X = CuVector{$elty}(undef, 1)
+            S = CuVector{$relty}(undef, 1)
+            params = Ref{gesvdjInfo_t}(C_NULL)
+            cusolverDnCreateGesvdjInfo(params)
+            lwork = Ref{Cint}(0)
+            try
+                $(Symbol(:unchecked_, bname))(dh, jobz, econ, m, n, A, lda, S,
+                                              X, max(1, m), X, max(1, n), lwork,
+                                              params[]) == CUSOLVER_STATUS_SUCCESS &&
+                    lwork[] > 0
+            finally
+                cusolverDnDestroyGesvdjInfo(params[])
+                unsafe_free!(X)
+                unsafe_free!(S)
+            end
+        end
+
         function gesvdj!(jobz::Char,
                          econ::Int,
                          A::StridedCuMatrix{$elty};
@@ -564,6 +603,8 @@ for (bname, fname, elty, relty) in ((:cusolverDnSgesvdj_bufferSize, :cusolverDnS
                          max_sweeps::Int=100)
             m,n     = size(A)
             lda     = max(1, stride(A, 2))
+            gesvdj_fits(jobz, econ, A) ||
+                throw(ArgumentError("CUSOLVER's gesvdj cannot handle a $m×$n matrix: its 32-bit workspace size overflows. Use svd(A; alg=QRAlgorithm()) or Xgesvd! instead."))
             # Warning! For some reason, the solver needs to access U and V even
             # when only the values are requested
             U = if jobz === 'V' && econ == 1 && m > n
